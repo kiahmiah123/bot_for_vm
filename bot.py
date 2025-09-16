@@ -1,6 +1,6 @@
-
 import os
 import logging
+import json
 from datetime import datetime
 from pytz import timezone
 from dotenv import load_dotenv
@@ -12,34 +12,70 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils import executor
 
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 
 # ---------- Load env ----------
+# локально: .env, на Railway берём переменные окружения
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 WELCOME_IMAGE_URL = os.getenv("WELCOME_IMAGE_URL")
-SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
-CHECKLIST_FAMILY = os.getenv("CHECKLIST_FAMILY", "https://t.me/yourchannel/1")
-CHECKLIST_IT = os.getenv("CHECKLIST_IT", "https://t.me/yourchannel/2")
-CHECKLIST_TOP_COMPLEXES = os.getenv("CHECKLIST_TOP_COMPLEXES", "https://drive.google.com/file/d/12aUi-WfJ3Ffs01QqTtj7zpAhkY3yssvZ/view?usp=drive_link")
 
+SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
+# НОВЫЕ имена переменных: весь JSON с сервисного аккаунта
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+
+# чек-листы (подставь свои ссылки в Variables)
+CHECKLIST_PRIMARY = os.getenv("CHECKLIST_PRIMARY", "")      # Как получить семейную ипотеку
+CHECKLIST_SECONDARY = os.getenv("CHECKLIST_SECONDARY", "")  # Как получить IT ипотеку
+CHECKLIST_THIRD = os.getenv("CHECKLIST_THIRD", "")          # Топ лучших ЖК
+
+# Проверки базовых переменных
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in .env")
+    raise RuntimeError("BOT_TOKEN is not set in environment variables")
 if not SPREADSHEET_ID:
-    raise RuntimeError("GOOGLE_SPREADSHEET_ID is not set in .env")
-if not os.path.exists("service_account.json"):
-    raise RuntimeError("service_account.json not found. Put your Google Service Account key file next to bot.py")
+    raise RuntimeError("GOOGLE_SPREADSHEET_ID is not set in environment variables")
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------- Google Sheets init ----------
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-creds = Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(SPREADSHEET_ID)
+# Поддерживаем два варианта:
+# 1) читать весь JSON из GOOGLE_CREDENTIALS (рекомендуется для Railway)
+# 2) fallback: если нет переменной, попытаться считать локальный service_account.json (для локальной отладки)
+if GOOGLE_CREDENTIALS:
+    try:
+        creds_info = json.loads(GOOGLE_CREDENTIALS)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        )
+    except Exception as e:
+        logger.exception("Failed to create credentials from GOOGLE_CREDENTIALS env: %s", e)
+        raise
+else:
+    # fallback для локальной разработки (если у тебя есть файл service_account.json в каталоге)
+    if os.path.exists("service_account.json"):
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                "service_account.json",
+                scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+            )
+        except Exception as e:
+            logger.exception("Failed to create credentials from service_account.json: %s", e)
+            raise
+    else:
+        raise RuntimeError("Google credentials not found: set GOOGLE_CREDENTIALS variable or provide service_account.json")
+
+# Авторизация gspread
+try:
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SPREADSHEET_ID)
+except Exception as e:
+    logger.exception("Failed to authorize gspread or open spreadsheet: %s", e)
+    raise
 
 def ensure_worksheet(name: str, headers: list):
     try:
@@ -59,6 +95,8 @@ ws_questions = ensure_worksheet("questions", [
     "timestamp", "user_id", "username", "full_name", "question"
 ])
 
+# ---------- Timezone ----------
+# При необходимости поменяй часовой пояс
 TZ = timezone("Europe/Kaliningrad")
 
 def now_str():
@@ -68,26 +106,34 @@ def safe_username(u: types.User):
     return f"@{u.username}" if u.username else ""
 
 def append_lead(user: types.User, data: dict):
-    ws_leads.append_row([
-        now_str(),
-        user.id,
-        safe_username(user),
-        f"{user.first_name or ''} {user.last_name or ''}".strip(),
-        data.get("district", ""),
-        data.get("rooms", ""),
-        data.get("deadline", ""),
-        data.get("purchase", ""),
-        data.get("budget", ""),
-    ], value_input_option="USER_ENTERED")
+    try:
+        ws_leads.append_row([
+            now_str(),
+            user.id,
+            safe_username(user),
+            f"{user.first_name or ''} {user.last_name or ''}".strip(),
+            data.get("district", ""),
+            data.get("rooms", ""),
+            data.get("deadline", ""),
+            data.get("purchase", ""),
+            data.get("budget", ""),
+        ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.exception("Failed to append lead to Google Sheets: %s", e)
+        raise
 
 def append_question(user: types.User, question: str):
-    ws_questions.append_row([
-        now_str(),
-        user.id,
-        safe_username(user),
-        f"{user.first_name or ''} {user.last_name or ''}".strip(),
-        question,
-    ], value_input_option="USER_ENTERED")
+    try:
+        ws_questions.append_row([
+            now_str(),
+            user.id,
+            safe_username(user),
+            f"{user.first_name or ''} {user.last_name or ''}".strip(),
+            question,
+        ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        logger.exception("Failed to append question to Google Sheets: %s", e)
+        raise
 
 # ---------- Telegram bot ----------
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
@@ -112,8 +158,7 @@ def main_menu():
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! 👋 Я помогу подобрать квартиру в Калининграде.\n\n"
-        "Выберите действие из меню ниже:",
+        "Привет! Я помогу подобрать квартиру.\n\nВыберите действие из меню ниже:",
         reply_markup=main_menu()
     )
     if WELCOME_IMAGE_URL:
@@ -207,7 +252,8 @@ async def lead_finish(message: types.Message, state: FSMContext):
         f"От: {safe_username(message.from_user)} (ID: {message.from_user.id})"
     )
     try:
-        await bot.send_message(ADMIN_ID, summary)
+        if ADMIN_ID:
+            await bot.send_message(ADMIN_ID, summary)
     except Exception as e:
         logger.error(f"Failed to send admin message: {e}")
 
@@ -217,8 +263,9 @@ async def lead_finish(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Failed to append to Google Sheets (leads): {e}")
         try:
-            await bot.send_message(ADMIN_ID, f"⚠️ Ошибка записи в Google Sheets (leads): {e}")
-        except Exception:
+            if ADMIN_ID:
+                await bot.send_message(ADMIN_ID, f"⚠️ Ошибка записи в Google Sheets (leads): {e}")
+        except:
             pass
 
 # ---------- Ask a Question ----------
@@ -248,7 +295,8 @@ async def receive_question(message: types.Message, state: FSMContext):
         f"От: {safe_username(message.from_user)} (ID: {message.from_user.id})"
     )
     try:
-        await bot.send_message(ADMIN_ID, summary)
+        if ADMIN_ID:
+            await bot.send_message(ADMIN_ID, summary)
     except Exception as e:
         logger.error(f"Failed to send admin question: {e}")
 
@@ -258,29 +306,34 @@ async def receive_question(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Failed to append to Google Sheets (questions): {e}")
         try:
-            await bot.send_message(ADMIN_ID, f"⚠️ Ошибка записи в Google Sheets (questions): {e}")
-        except Exception:
+            if ADMIN_ID:
+                await bot.send_message(ADMIN_ID, f"⚠️ Ошибка записи в Google Sheets (questions): {e}")
+        except:
             pass
 
 # ---------- Checklists ----------
 @dp.message_handler(lambda m: m.text == "📋 Чек-листы")
 async def checklists(message: types.Message):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    # Кнопки — используем тексты, соответствующие твоим переменным
     kb.add("Как получить семейную ипотеку")
-    kb.add("Как получить IT-ипотеку")
-    kb.add("Лучшие ЖК Калининграда")
+    kb.add("Как получить IT ипотеку")
+    kb.add("Топ лучших ЖК")
     kb.add("↩️ Назад")
     await message.answer("Выберите чек-лист:", reply_markup=kb)
 
-@dp.message_handler(lambda m: m.text in ["Как получить семейную ипотеку", "Как получить IT-ипотеку", "Лучшие ЖК Калининграда"])
+@dp.message_handler(lambda m: m.text in ["Как получить семейную ипотеку", "Как получить IT ипотеку", "Топ лучших ЖК"])
 async def checklist_links(message: types.Message):
     mapping = {
-        "Как получить семейную ипотеку": CHECKLIST_FAMILY,
-        "Как получить IT-ипотеку": CHECKLIST_IT,
-        "Лучшие ЖК Калининграда": CHECKLIST_TOP_COMPLEXES,
+        "Как получить семейную ипотеку": CHECKLIST_PRIMARY,
+        "Как получить IT ипотеку": CHECKLIST_SECONDARY,
+        "Топ лучших ЖК": CHECKLIST_THIRD,
     }
     link = mapping.get(message.text)
-    await message.answer(f"Вот ваш чек-лист: {link}", disable_web_page_preview=False)
+    if link:
+        await message.answer(f"Вот ваш чек-лист: {link}", disable_web_page_preview=False)
+    else:
+        await message.answer("Чек-лист пока недоступен.", reply_markup=main_menu())
 
 # Fallback: unknown text -> show menu
 @dp.message_handler(content_types=types.ContentTypes.ANY)
